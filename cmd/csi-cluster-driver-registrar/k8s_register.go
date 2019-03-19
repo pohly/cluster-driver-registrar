@@ -21,55 +21,43 @@ import (
 	"os/signal"
 	"time"
 
-	k8scsi "k8s.io/api/storage/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog"
 )
 
 func kubernetesRegister(
-	config *rest.Config,
-	csiDriver *k8scsi.CSIDriver,
+	name string,
+	add func() error,
+	remove func() error,
 ) {
-	// Get client info to CSIDriver
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		klog.Error(err.Error())
-		os.Exit(1)
-	}
-
 	// Set up goroutine to cleanup (aka deregister) on termination.
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
-	go cleanup(c, clientset, csiDriver)
+	go cleanup(c, name, remove)
 
 	// Run forever
 	for {
-		verifyAndAddCSIDriverInfo(clientset, csiDriver)
+		verifyAndAddCSIDriverInfo(name, add)
 		time.Sleep(sleepDuration)
 	}
 }
 
-func cleanup(c <-chan os.Signal, clientSet *kubernetes.Clientset, csiDriver *k8scsi.CSIDriver) {
+func cleanup(c <-chan os.Signal, name string, remove func() error) {
 	<-c
-	verifyAndDeleteCSIDriverInfo(clientSet, csiDriver)
+	verifyAndDeleteCSIDriverInfo(name, remove)
 	os.Exit(1)
 }
 
 // Registers CSI driver by creating a CSIDriver object
 func verifyAndAddCSIDriverInfo(
-	csiClientset *kubernetes.Clientset,
-	csiDriver *k8scsi.CSIDriver,
+	name string,
+	add func() error,
 ) error {
 	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		csidrivers := csiClientset.StorageV1beta1().CSIDrivers()
-
-		_, err := csidrivers.Create(csiDriver)
+		err := add()
 		if err == nil {
-			klog.V(1).Infof("CSIDriver object created for driver %s", csiDriver.Name)
+			klog.V(1).Infof("CSIDriver object created for driver %s", name)
 			return nil
 		} else if apierrors.IsAlreadyExists(err) {
 			klog.V(1).Info("CSIDriver CRD already had been registered")
@@ -83,14 +71,13 @@ func verifyAndAddCSIDriverInfo(
 
 // Deregister CSI Driver by deleting CSIDriver object
 func verifyAndDeleteCSIDriverInfo(
-	csiClientset *kubernetes.Clientset,
-	csiDriver *k8scsi.CSIDriver,
+	name string,
+	remove func() error,
 ) error {
 	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		csidrivers := csiClientset.StorageV1beta1().CSIDrivers()
-		err := csidrivers.Delete(csiDriver.Name, &metav1.DeleteOptions{})
+		err := remove()
 		if err == nil {
-			klog.V(1).Infof("CSIDriver object deleted for driver %s", csiDriver.Name)
+			klog.V(1).Infof("CSIDriver object deleted for driver %s", name)
 			return nil
 		} else if apierrors.IsNotFound(err) {
 			klog.V(1).Info("No need to clean up CSIDriver since it does not exist")

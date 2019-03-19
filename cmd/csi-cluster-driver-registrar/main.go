@@ -31,9 +31,15 @@ import (
 
 	k8scsi "k8s.io/api/storage/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
+
+	// For CRD in Kubernetes 1.13.
+	k8scsialpha "k8s.io/csi-api/pkg/apis/csi/v1alpha1"
+	k8scsiclient "k8s.io/csi-api/pkg/client/clientset/versioned"
 )
 
 const (
@@ -108,19 +114,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create CSIDriver object
-	csiDriver := &k8scsi.CSIDriver{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: csiDriverName,
-		},
-		Spec: k8scsi.CSIDriverSpec{
-			AttachRequired: &k8sAttachmentRequired,
-			PodInfoOnMount: k8sPodInfoOnMount,
-		},
-	}
-
-	klog.V(2).Infof("CSIDriver object: %+v", *csiDriver)
-
 	// Create the client config. Use kubeconfig if given, otherwise assume
 	// in-cluster.
 	klog.V(1).Infof("Loading kubeconfig.")
@@ -130,8 +123,85 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Get client info to CSIDriver
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		klog.Error(err.Error())
+		os.Exit(1)
+	}
+
+	var add func() error
+	var remove func() error
+	resources, err := discovery.ServerResources(clientset)
+	if err != nil {
+		klog.Error("failed to query server resources: %v", err)
+		os.Exit(1)
+	}
+
+	if hasResource(resources, k8scsi.SchemeGroupVersion.String(), "CSIDriver") {
+		// Create CSIDriver object using the beta API.
+		csiDriver := &k8scsi.CSIDriver{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: csiDriverName,
+			},
+			Spec: k8scsi.CSIDriverSpec{
+				AttachRequired: &k8sAttachmentRequired,
+				PodInfoOnMount: k8sPodInfoOnMount,
+			},
+		}
+		klog.V(2).Infof("%s CSIDriver object: %+v", k8scsi.SchemeGroupVersion, *csiDriver)
+		csidrivers := clientset.StorageV1beta1().CSIDrivers()
+
+		add = func() error {
+			_, err := csidrivers.Create(csiDriver)
+			return err
+		}
+
+		remove = func() error {
+			return csidrivers.Delete(csiDriverName, &metav1.DeleteOptions{})
+		}
+	} else if hasResource(resources, k8scsialpha.SchemeGroupVersion.String(), "CSIDriver") {
+		// Create CSIDriver object using the alpha API (based on CRD, available on Kubernetes 1.13).
+		csiDriver := &k8scsialpha.CSIDriver{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: csiDriverName,
+			},
+			Spec: k8scsialpha.CSIDriverSpec{
+				AttachRequired: &k8sAttachmentRequired,
+			},
+		}
+		if *k8sPodInfoOnMount {
+			// Only a single version was ever supported.
+			version := "v1"
+			csiDriver.Spec.PodInfoOnMountVersion = &version
+		}
+		klog.V(2).Infof("%s CSIDriver object: %+v", k8scsialpha.SchemeGroupVersion, *csiDriver)
+		// csidrivers := k8scsiclient.New(clientset.Discovery().RESTClient()).CsiV1alpha1().CSIDrivers()
+		clientset, err := k8scsiclient.NewForConfig(config)
+		if err != nil {
+			klog.Error(err.Error())
+			os.Exit(1)
+		}
+		csidrivers := clientset.CsiV1alpha1().CSIDrivers()
+
+		add = func() error {
+			_, err := csidrivers.Create(csiDriver)
+			return err
+		}
+
+		remove = func() error {
+			return csidrivers.Delete(csiDriverName, &metav1.DeleteOptions{})
+		}
+	} else {
+		klog.Error("not compatible with this Kubernetes cluster, need support for CSIDriver in one of the following APIs: ",
+			k8scsi.SchemeGroupVersion,
+			k8scsialpha.SchemeGroupVersion,
+		)
+		os.Exit(1)
+	}
+
 	// Run forever
-	kubernetesRegister(config, csiDriver)
+	kubernetesRegister(csiDriverName, add, remove)
 }
 
 func buildConfig(kubeconfig string) (*rest.Config, error) {
@@ -152,4 +222,17 @@ func isAttachRequired(ctx context.Context, conn *grpc.ClientConn) (bool, error) 
 	}
 
 	return capabilities[csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME], nil
+}
+
+func hasResource(resources []*metav1.APIResourceList, groupVersion string, kind string) bool {
+	for _, list := range resources {
+		if list.GroupVersion == groupVersion {
+			for _, resource := range list.APIResources {
+				if resource.Kind == kind {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
